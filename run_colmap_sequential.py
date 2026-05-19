@@ -35,6 +35,18 @@ def main():
                    help="Path to vocab tree .bin file (only if --loop-detection)")
     p.add_argument("--num-threads", type=int, default=4)
     p.add_argument("--max-features", type=int, default=8192)
+    p.add_argument("--db-path", default=None,
+                   help="Database path (default: <dataset>/database.db). Use a "
+                        "per-run DB to avoid clobbering another tier's features.")
+    p.add_argument("--out-subdir", default="sparse",
+                   help="Output subdir for the reconstruction (default: sparse)")
+    p.add_argument("--camera-params", default=None,
+                   help="Prime intrinsics 'f,cx,cy,k' for SIMPLE_RADIAL "
+                        "(fixes the degenerate-k divergence, memory Issue #10)")
+    p.add_argument("--no-refine-extra", action="store_true",
+                   help="Disable ba_refine_extra_params (keep primed k fixed)")
+    p.add_argument("--no-refine-focal", action="store_true",
+                   help="Disable ba_refine_focal_length (keep primed f fixed)")
     args = p.parse_args()
 
     if args.loop_detection and not args.vocab_tree:
@@ -43,8 +55,8 @@ def main():
 
     dataset_dir = args.dataset_dir
     image_dir = os.path.join(dataset_dir, args.image_subdir)
-    db_path = os.path.join(dataset_dir, "database.db")
-    sparse_dir = os.path.join(dataset_dir, "sparse")
+    db_path = args.db_path or os.path.join(dataset_dir, "database.db")
+    sparse_dir = os.path.join(dataset_dir, args.out_subdir)
     os.makedirs(sparse_dir, exist_ok=True)
 
     if os.path.exists(db_path):
@@ -53,6 +65,9 @@ def main():
 
     reader_opts = pycolmap.ImageReaderOptions()
     reader_opts.camera_model = "SIMPLE_RADIAL"
+    if args.camera_params:
+        reader_opts.camera_params = args.camera_params
+        print(f"Primed camera_params: {args.camera_params}")
 
     extraction_opts = pycolmap.FeatureExtractionOptions()
     extraction_opts.sift.first_octave = 0
@@ -111,7 +126,8 @@ def main():
     pipeline_opts = pycolmap.IncrementalPipelineOptions()
     pipeline_opts.multiple_models = False
     pipeline_opts.ba_refine_principal_point = False
-    pipeline_opts.ba_refine_extra_params = True
+    pipeline_opts.ba_refine_extra_params = not args.no_refine_extra
+    pipeline_opts.ba_refine_focal_length = not args.no_refine_focal
     pipeline_opts.num_threads = args.num_threads
 
     reconstructions = pycolmap.incremental_mapping(

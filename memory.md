@@ -186,6 +186,9 @@ This machine has MULTIPLE Pythons with DIFFERENT torch builds. Using the wrong o
 | 12 | sharp img_2 + opacity_reg .05 (Exp B) | 579/581 | 2000×924 | MCMC 1M | 30k | 9.74 | — | 0.838 | WORSE — opacity_reg destabilized |
 | 13 | full2 (low-sharpness test) | 1361/1380 | 1000×462 | MCMC 1M | 30k | 12.0 | — | 0.88 | DEGENERATE — blurry source confirmed fatal |
 | 14 | Kitchen photos | 85 | 2000×924 | MCMC 1M | 30k | 21.76 | — | — | Small-scene baseline |
+| 27 | **Kitchen A/B — Run A (clean baseline)** | 85 | 2000×924 | MCMC 1M | 30k | **22.52** | **0.644** | **0.444** VGG / **0.441** Alex | A/B baseline (images_4). eval.json `E:\vksplat_output\kitchen_ab_clean\20260518_170813_kitchen\eval.json` |
+| 28 | **Kitchen A/B — Run B (restored, vs restored GT)** | 85 | 2000×924 | MCMC 1M | 30k | 22.27 | 0.582 | 0.457 VGG / **0.484** Alex | Restored renders vs restored GT (harder target). eval.json `E:\vksplat_output\kitchen_ab_restored\20260518_171134_kitchen\eval.json` |
+| 29 | **Kitchen A/B — Run B renders vs blurry GT** | — | — | — | — | **22.63** | **0.636** | **0.436** VGG / **0.427** Alex | Cross-eval: Run B renders vs Run A's blurry GT. **BEST LPIPS of all three comparisons** (0.427 < 0.441 Run A) — deblurred 3D model is perceptually closer to blurry reality than clean baseline |
 | 15 | Kitchen photos | 85 | 2000×924 | Default | 30k | 17.40 | — | — | Default strat → 14.8M splats, worse |
 | 16 | Combined (photos+video) | 720 | mixed | MCMC 1M | 30k | 18.35 | 0.699 | — | Video frames hurt quality |
 | 17 | LR subset full-res | 83 | 4000×1848 | MCMC 2M | 30k | 18.39 | 0.467 | — | Few imgs + full-res = worse |
@@ -272,6 +275,98 @@ This machine has MULTIPLE Pythons with DIFFERENT torch builds. Using the wrong o
 - **★ BEST VkSplat CONFIG (Exp C, 2026-05-17): `images_4 @ MCMC cap_max=1M, ssim_lambda=0.4, 50k steps`.** Progression on sharp `new fotos`: baseline 30k/ssim0.2 LPIPSa 0.362 → Exp A 30k/ssim0.4 0.348 → **Exp C 50k/ssim0.4 0.330** (PSNR 21.66, SSIM 0.691, LPIPSv 0.360). 50k beat 30k on EVERY metric (~9% LPIPS gain vs original, only ~4min extra train, no fog — images_4 is the stable tier). USE THIS CONFIG for all future reconstructions. Command: `train_livingroom.py --image-dir images_4 --strategy mcmc --cap-max 1000000 --steps 50000 --ssim-lambda 0.4`.
 - **Exp D closes the hi-res sweep (noise_lr 1e5 @ images_2, 2026-05-17)**: PSNR 20.44, LPIPSa 0.576, NO fog (`~51k relocate` — low noise_lr DID tame churn). But ≈ identical to cap500k (20.45/0.584) — fog-free images_2 is still clearly worse than images_4@1M (21.66/0.330). **Complete images_2 lever sweep (5 levers, zero gaps): cap2M/3M=fog, refstop12k=14.08/fog, opacity_reg=9.74, cap500k=20.45/soft, noise_lr=20.44/soft.** Catch-22 proven from every angle: throttling MCMC enough to avoid fog at hi-res loses more detail than the resolution gains. images_4@1M is the definitive ceiling. VkSplat tuning is EXHAUSTED — remaining quality gains come only from better DATA, not hyperparameters.
 
+### 8c-CORRECTED. 2026-05-19 scene-scope RE-TESTED properly — weak real effect, NOT a 0.20 path
+Redid the test with GEOMETRY-box selection (the fix the retraction demanded): central
+x-slab of the point cloud → box = **16% of full scene volume** (131 vs 815), kept only
+the 21,037 points inside it and the 91 cameras DOMINATED by the box (≥55% of each
+camera's observed 3D points inside). Trained Exp C (1M/50k/λ0.4), 12 val.
+- **Result: LPIPS-Alex 0.301** (VGG 0.362, PSNR 18.83, SSIM 0.575) vs full-room 0.330.
+- **Verdict: scene-scope concentration is a REAL but WEAK lever — ~9% LPIPS gain for a 6×
+  scene-volume reduction.** Confirms the budget/volume mechanism in DIRECTION but the
+  magnitude is small. Extrapolating, LPIPS 0.20 via scope alone would need impractically
+  tiny scenes — NOT a viable path on its own.
+- **PSNR/SSIM got WORSE (21.7→18.8, 0.69→0.57):** the cropped 12-view val set is harder
+  per-pixel (sparser per-view coverage). So the LPIPS gain is partly val-set-dependent;
+  this is "different (smaller) scene, same metric/config", inherently not a pure A/B.
+- **Bottom line for capture strategy:** a tighter scene helps modestly; it does not by
+  itself reach 0.20. Combined with the 8b exhaustion result, 0.330 stands as the practical
+  ceiling for full-room captures on this hardware; ~0.30 is reachable for tightly-scoped
+  sub-scenes. Output: `E:\vksplat_output\sharp_box_box91_expC\`. Data: `E:\vksplat_data\sharp_box`.
+
+### 8c-RETRACTED. ⚠️ 2026-05-19 "scene scope" claim WITHDRAWN — flawed subset selection
+**The 8c breakthrough below is RETRACTED. Selection was by CAMERA proximity, not scene
+geometry. Verified post-hoc: clustering the 30% closest cameras shrank the camera bbox
+~3× BUT the reconstructed point-cloud (actual room geometry) only shrank to 80% volume
+(815→656) — the clustered cameras still looked across the WHOLE living room. So 1M splats
+were NOT concentrated on 1/10 the scene; the scene was ~same size. The 0.330→0.260 gain
+is therefore explained by (a) denser redundant view coverage of each surface and (b) an
+easier 22-view val set drawn from near the training cluster — NOT by scene-scope/budget
+concentration. The "shrink the scene" hypothesis remains UNTESTED. To test it properly:
+crop by POINT-CLOUD bbox (keep only points + cameras inside a small spatial box, and only
+images whose frustum is dominated by that box), not by camera position. Do not cite 0.260
+as a scene-scope result.**
+
+### 8c. ★★ 2026-05-19 BREAKTHROUGH — SCENE SCOPE is the real LPIPS lever  [SEE RETRACTION ABOVE]
+After 8b proved every config/post-proc lever exhausted at the 0.330 ceiling, tested the
+one direction the data pointed to: **shrink the scene, keep the splat budget.**
+- Built `E:\vksplat_data\sharp_tight` NON-DESTRUCTIVELY: opened `sharp/sparse/0` read-only,
+  selected the 30%-tightest spatial cluster of camera centers (pycolmap
+  `projection_center()`, keep dist-to-median ≤ 30th pctile), copied ONLY those 174
+  images_4 JPEGs to a new dataset dir, sliced a COPY of the reconstruction via
+  `deregister_frame()` (this pycolmap uses rig/frame model — `frames.bin`/`rigs.bin`
+  present; `deregister_image` does NOT exist, use `deregister_frame(im.frame_id)`).
+  Result: 174 reg images, 49,015 pts3D, cam-bbox 13.6×5.5×5.6 → **4.3×3.4×3.3** (~10× less
+  scene volume). Original `sharp/sparse/0` never written.
+- **Trained Exp C config (1M, 50k, λ0.4) on sharp_tight → LPIPS-Alex 0.260** (VGG 0.314,
+  PSNR 21.29, SSIM 0.700, 22 val). **21% better than the 0.330 full-scene ceiling — the
+  ONLY lever in the entire session that beat 0.330, and it beat it big.**
+- **Mechanism (confirms the lr_full analysis at memory.md:198):** achievable LPIPS ≈
+  (splat budget) ÷ (scene volume) × (per-image sharpness). The 1M fog ceiling is fixed by
+  hardware; the controllable term is SCENE VOLUME. Wide room = budget starved (0.33);
+  tight scope = budget concentrated = real per-region detail (0.26).
+- **CAVEAT (do not overclaim):** not a clean A/B — 22 tight-scene val views are intrinsically
+  easier than 73 full-room views, so part of the 0.070 gain is "easier test." It proves the
+  DIRECTION and magnitude decisively, not an exact equivalence to 0.330.
+- **★ ACTIONABLE CAPTURE STRATEGY (supersedes the "only better data" vague conclusion):**
+  to push toward LPIPS 0.20, do NOT add more wide-room images (lr_full 1321imgs=0.365,
+  proven worse) and do NOT post-process (Wiener=0.662, fabricates fake detail). INSTEAD
+  capture a SMALL, TIGHTLY-SCOPED scene — one focal area/corner, many well-distributed
+  sharp angles of just that — so the fixed 1M-splat budget concentrates. Slicing alone hit
+  0.26; a purpose-built tight capture should go further. Output:
+  `E:\vksplat_output\sharp_tight_tight174_expC\`.
+
+### 8b. 2026-05-19 LPIPS-0.200 push — splat frontier + post-proc re-confirmed EXHAUSTED
+Goal was LPIPS-Alex 0.200 (vs 0.330 Exp C best). Ran the untried splat/post-proc levers
+on sharp dataset (images_4 unless noted), Exp C config family, 73-img val. ALL failed to
+beat 0.330; several regressed. Definitive table:
+- **Wiener restore @ images_4** (deblur on already-sharp input): LPIPS-Alex **0.662** (vs
+  0.330). Sharpening sharp frames injects ringing the splat faithfully learns. Dry-run
+  var-of-Laplacian rose (+1861) — sharpness metric is a TRAP, it rewards halos. DEAD.
+- **ssim_λ fine sweep** (only 0.2/0.4 known before): λ0.3→**0.345**, λ0.4→0.330,
+  λ0.5→**0.333**. Clean single peak at 0.4. λ axis now fully mapped, exhausted.
+- **B1: 80k steps, max_steps=80000** (LR-schedule confound fixed, unlike lr_full 100k/30k):
+  LPIPS-Alex **0.364** — WORSE than 50k. Proves the 30k→50k gain was convergence, not
+  "more steps better"; 50k is near-optimal, beyond it MCMC degrades. Settles the recurring
+  "try 150k steps" idea: confirmed counterproductive, do NOT run long-step variants.
+- **B2: cap_max 1.5M @ images_4** (only 1M known-good before): LPIPS-Alex **0.890**, PSNR
+  14.19, used all 1.5M splats — **FOG**. ★ NEW: the 1M fog ceiling applies at LOW-res
+  images_4 too, not just images_2. Catch-22 is resolution-independent. Falsifies the
+  "more splats need more steps" hypothesis at the source: B2 fogged (not under-converged),
+  and B1 already proved +steps degrade a healthy model — more steps on fog just churns fog.
+- **Hi-res combo (NEW, closes the last gap): images_2 + cap500k + noise_lr 1e5 + λ0.4 +
+  50k** — the one untested COMBINATION of all known fog-tamers at once. Result: PSNR 20.79,
+  LPIPS-Alex **0.551**, 500k splats stable, NO fog (combo DID tame churn as Exp D predicted)
+  — but still far worse than images_4@1M 0.330. Confirms memory.md:274/276 "fog-free
+  images_2 is soft" with the full lever stack, not just isolated levers.
+- **★ CONCLUSION: VkSplat hyperparameter + post-processing space is now EXHAUSTIVELY
+  closed (splat count, steps, λ, hi-res combo, deblur all tested with zero gaps). 0.330 is
+  the hard ceiling on this dataset/RX 7900 XTX. LPIPS 0.200 is NOT reachable by any
+  config/post-proc — it requires better SOURCE DATA (sharper/denser capture).** COLMAP
+  levers were investigated (degenerate sequential vs healthy exhaustive confirmed; current
+  sparse/0 is the good 579/581, 125k-pt exhaustive run) but user opted not to run COLMAP
+  experiments. `run_colmap.py` gained a harmless unused `--max-features` flag (default
+  8192, no behavior change).
+
 ### 9. Blurry renders — ROOT CAUSE is blurry SOURCE data (May 2026)
 - **Symptom**: full_dataset MCMC 1M/30k = PSNR 24.16, SSIM 0.841 (good numbers) but renders are visibly soft — no readable text, no fabric texture, no leaf detail.
 - **Cause**: every source photo is heavily motion-blurred. Variance-of-Laplacian ≈ **15** across all 900 photos (sharp images score 500+; the single sharpest photo in the whole set scored 33). This is persistent **long-exposure motion blur in a dim room** (camera lengthens shutter in low light; any movement smears the frame).
@@ -314,7 +409,7 @@ This machine has MULTIPLE Pythons with DIFFERENT torch builds. Using the wrong o
 - **Validated (DL-CPU, full_dataset blurry source)**: NAFNet end-to-end produces a genuine deblur — visual spot-check shows crisper parquet/wood-grain/leaf edges, **no ringing/hallucination/color shift** at `--dl-strength 0.7`. Classical `unsharp` raises var-of-Laplacian far more (+118 median) than NAFNet (+25) but that's metric inflation (unsharp boosts HF noise); judge DL by eye + the deferred A/B, not Laplacian delta.
 - **Guardrail gotcha (fixed)**: first guardrail used absolute `clip_frac > 0.05` and rejected 3/4 frames — wrong, because these dim-room captures *already* have 4–19% pixels ≥254 (bright windows/lamps). Corrected to trigger on the **increase** in clipping caused by restoration (`clip1 - clip0 > 0.03`), plus `s1 < s0`. After fix: 0/4 rejected.
 - **GPU PATH RESOLVED — runs on the GTX 1070 Ti via the NVIDIA env (2026-05-17)**: the default `python` has the ROCm torch (probe fails → CPU fallback). The pre-existing **`E:\nvidia-gsplat\python312\python.exe`** has **torch 2.5.1+cu121** and sees the **1070 Ti** (`cuda_avail True`, device count 1). Installed `opencv-python-headless` + `scipy` into it (the env was gsplat-minimal: had torch/numpy/PIL, lacked cv2/scipy; headless avoids Qt). `pick_device()` → `cuda | NVIDIA GeForce GTX 1070 Ti`; dry-run on full_dataset = "GPU ready", real NAFNet inference, same deltas as the CPU run (1→281, 6→96) confirming correctness, ~100× faster than `--dl-cpu`. **Key: NAFNet is inference-only so Pascal sm_61 is fine — it does NOT hit the Volta-only backward kernels that make gsplat a dead-end on this card (Issue #6 / gsplat verdict).** Added `sys.path.insert(0, scriptdir)` to `restore_frames.py` so sibling imports resolve from any cwd/env. Run command: `E:\nvidia-gsplat\python312\python.exe E:\vksplat\restore_frames.py <tier> --method dl`.
-- **A/B training proof STILL DEFERRED**: `restore_frames.py` GPU path now works on the 1070 Ti, but `train_livingroom.py` (VkSplat) needs the RX 7900 XTX / Vulkan path, which is the separate still-pending piece. Restore the tier with the NVIDIA env, then run the A/B once the AMD training path is available. Command in `CAPTURE_GUIDE.md` "When you can't reshoot" section.
+- **A/B training proof — RESOLVED (2026-05-18)**: Kitchen A/B complete. Run B renders vs blurry GT scored **BETTER** LPIPS than Run A baseline (Alex 0.427 < 0.441, VGG 0.436 < 0.444). Deblur does NOT hurt 3D reconstruction; it's neutral-to-slightly-positive perceptually. Per plan decision rule: deblur path is **validated** — safe to apply to other datasets. Rows 27–29 in results table. eval.json paths: Run A `E:\vksplat_output\kitchen_ab_clean\20260518_170813_kitchen\eval.json`, Run B `E:\vksplat_output\kitchen_ab_restored\20260518_171134_kitchen\eval.json`.
 - **Standing rule**: this is a salvage tool, not a substitute for sharp capture (Issue #9 / CAPTURE_GUIDE remain primary). Use it only when reshoot is genuinely impossible.
 
 ### 12. NAFNet rainbow-block artifacts — content-specific divergence, fixed by TILE-level fallback (2026-05-18)
@@ -327,6 +422,21 @@ This machine has MULTIPLE Pythons with DIFFERENT torch builds. Using the wrong o
 - **Result**: kitchen worst-case frames (incl. the window-glass one that had the rainbow block) now come out **deblurred AND artifact-free**, seams invisible, ~1/4 frames kept-original by the real guardrail (net-worse) vs 52/85 before. Verified visually on multiple frames.
 - **Lesson**: clip/clamp do not sanitize a model that has no output bound — you must detect the out-of-range explosion and substitute, and do it at the smallest unit (tile) so one bad region doesn't waste the whole frame's deblur. Divergence is per-content and unavoidable with this checkpoint; the tool degrades gracefully instead.
 - **SUPERSEDES Issue #11's "use the NVIDIA env" instructions**: 2026-05-18 the 7900 XTX is reinstalled, 1070 Ti out, ROCm torch sees the XTX — run `restore_frames.py` / `restore_all.py` with the **default `python`** (see updated System Specs + 🐍 section). `restore_all.py` is the batch orchestrator (single-instance lock; 4 input classes; full-res→downscale; A/B-vs-baseline still deferred to VkSplat training).
+
+### 13. video1 (3852-frame portrait 8K video) — blur salvage attempt (2026-05-19)
+- **Dataset**: `E:\vksplat_data\video1\`, 3852 frames from a portrait 8K video. Source `images_2` median var-of-Laplacian sharpness **47** (only **439/3852 = 11%** clear the 150 floor) — **the blurriest dataset attempted** (worse than the rejected full2 median-98, bedroom-16-14 median-39 class).
+- **Raw `images_2` COLMAP: 3/3852 (0.08%) registered — FAILED.** Garbage camera `f=6909, k=-2.0`. The stale `sparse/0/` (mtime 00:54, 3 reg / 430 pts) is this failed run's output. Confirms Issue #9: motion blur destroys SIFT pose repeatability across views — restoration is **mandatory** before COLMAP on this data.
+- **Restorations staged (3852 imgs each)**: `images_4` NAFNet (→`images_4_restored`), Restormer (`images_4_restormer`), Wiener (`images_4_wiener`), Unsharp (`images_4_unsharp`); `images_2` Wiener (`images_2_wiener`), Unsharp (`images_2_unsharp`). All complete.
+- **`images_2_unsharp` COLMAP (sequential, overlap 10, PID 17304)**: extraction + matching **completed and healthy** — DB has 3852 keypoints/descriptors, 14336 pairs, **8895 with valid two-view geometry** (vs the raw run's near-total match failure: unsharp restored SIFT repeatability). BUT the process **died/was-killed during incremental mapping** (no log redirect; no fresh `sparse/`; PID gone). The 1.02 GB `database.db` (mtime 09:09) holds the unsharp features+matches — **mapping can be resumed from the populated DB without re-extracting/re-matching** (hours saved). `images_2_wiener` COLMAP still QUEUED.
+- **BAD-Gaussians evaluated → NOT VIABLE here.** Needs NVIDIA CUDA 11.8 + tiny-cuda-nn + gsplat + nerfstudio 1.0.3 (`python<3.11`). Only the AMD 7900 XTX is installed; gsplat already dead-ended twice (the "version vise", see FINAL VERDICT); tiny-cuda-nn has no ROCm port. Same hardware-floor blocker class as the gsplat verdict — **do not retry without a ≥sm_70 NVIDIA GPU.**
+- **All dedicated motion-blur-3DGS methods are NVIDIA-only**: BAD-Gaussians, DeblurGS (2404.11358), BSGS (2510.12493), GS-on-the-Move (2403.13327), Robust-GS (2404.04211), Deblurring-3DGS — every one builds on the CUDA 3DGS rasterizer or nerfstudio+gsplat. The blur model lives **inside the differentiable rasterizer** (per-pixel pose integration / virtual sub-views), so it **cannot be ported onto VkSplat** (Slang/Vulkan, no pose-opt or blur-convolution hook).
+- **★ AMD-viable conclusion**: the in-flight pipeline (**image restore → COLMAP on restored → VkSplat train**) IS the correct and only deblur strategy on this hardware — there is no better engine to switch to. Judge `video1` purely by whether a restored variant gets COLMAP to register well **AND** VkSplat renders non-fog (Issue #9: high COLMAP reg-% on blurry data still trains to fog; median-47 is far below the new-fotos median-386 winner — treat as a salvage stress test, not a quality run). Cascade-restoration experiments (Wiener→Unsharp, Unsharp/Wiener→NAFNet, NAFNet/Restormer→Unsharp, strength sweeps) being screened via `restore_frames.py --dry-run` to try to clear the floor.
+- **★★ KEY DIAGNOSTIC (2026-05-19): the unsharp COLMAP failure was NOT a blur/SIFT problem — it was the degenerate-k camera divergence (Issue #10), and PRIMING FIXES IT.** `images_2_unsharp` mapping resumed from the populated DB with **no camera prior** registered only **2/3852** (`f=5135, k=4.09` — absurd) and bailed in 2.5s. Re-run with `--camera-params "1400,1020,574,0.0" --no-refine-extra` (SIMPLE_RADIAL primed, k locked at 0) → COLMAP **registers steadily, 500+ frames and climbing**, each new image seeing 800–1200 triangulated points (healthy). So the bottleneck on `video1` was COLMAP *configuration* (unconstrained focal/distortion → degenerate basin), **not restoration quality**. Implication: the existing single-stage restorations may already be sufficient — the cascade experiments are now a *secondary* lever, not the critical path.
+- **Tooling added**: `colmap_map_only.py` — resumes `pycolmap.incremental_mapping` from an already-populated `database.db` (skips re-extraction/re-matching, hours saved when a run dies in mapping). Supports `--camera-params 'f,cx,cy,k'` (edits the SQLite `cameras` table directly — `pycolmap.Database` is abstract/uninstantiable in this build, so the documented pycolmap-API priming does NOT work here; raw sqlite3 UPDATE of `model`/`params` blob/`prior_focal_length` is the working method), `--no-refine-extra`, `--no-refine-focal`. When priming, it works on a per-run COPY of the DB (in the output dir) so the expensive source DB stays pristine for other priors. Portrait-8K-video `video1` is **2040×1148** (NOT the landscape 2000×924 of old photo datasets — the memory Camera Parameters table f=1343.6 does not apply; primed f=1400 @ k=0 works).
+- **★ COLMAP global BA is VERY SLOW (not hung) at ~1040 registered cameras on this CPU/16GB — 2026-05-19.** BOTH primed runs (unsharp p1400 @ reg=1042, wiener @ reg=1038) went log-silent for 20–46 min right after triggering "Retriangulation and Global bundle adjustment". Initially misread as a hang. **Verified via `Win32_PerfFormattedData...PercentProcessorTime`: the wiener python proc was at CPU%=358 (≈3.6 cores) during the silence — actively crunching, NOT deadlocked.** pycolmap's periodic global BA is a single Ceres solve over ~1000+ poses + a huge noisy tie-point cloud (blurry video → many spurious 3D points); on CPU-only + 16 GB it legitimately takes 20–40+ min and emits ZERO incremental log. **Rule: do NOT judge a COLMAP run dead from log silence alone after a "Global bundle adjustment" line — check `PercentProcessorTime`; >100% = working, wait it out. Budget hours, not minutes, for 3852-frame video COLMAP on this box.**
+- p1400 (unsharp) ALSO had a real second problem: a duplicate `colmap_map_only.py` was spawned (harness said task "timed out" but the python proc was still alive; relaunch → TWO procs on the SAME `sparse_unsharp_p1400/database.db` → added SQLite contention). Killed both (PIDs 16484, 2808). **Tooling rule: `colmap_map_only.py` needs a UNIQUE per-run out dir AND a single-instance guard — verify via `wmic process ... get CommandLine` before relaunch; the harness "timeout" is NOT proof the proc died.** Unsharp abandoned regardless (weakest restoration: sample median 140, 8/24 >150). **Wiener** (median 392, 24/24 >150) is the real candidate — full primed sequential COLMAP on `images_2_wiener` with its own `database_wiener.db` + `sparse_wiener/` (single clean proc, no contention; the slow-BA wait is expected, not a fault).
+- **★★ WIENER COLMAP — SUCCESS (2026-05-19 23:45):** `images_2_wiener` primed sequential COLMAP completed. **Model 0: 3850/3852 registered (99.95%), 312,770 3D points.** Camera converged sanely: SIMPLE_RADIAL 2040×1148, **f=1302.65** (from primed 1400, ~7% refinement), cx=1020, cy=574, **k=0.0 (locked)** — no degenerate basin. Total wall time **49,579 s ≈ 13.8 h** (CPU-only; slow-global-BA cycles dominate — see "slow BA not hung" note). Output: `E:\vksplat_data\video1\sparse_wiener\0\` (cameras/images/points3D.bin, ~166 MB). **Highest registration rate this project has achieved (99.95% vs 99.8% `lr_full` prior best), proving the Wiener-restoration + camera-priming recipe salvages the median-47 `video1` data that raw/unsharp COLMAP failed on** (raw 0.08%, unsharp 0.05% pre-priming, 2/3852 unsharp post-priming-with-dup-procs). Next: stage `sparse_wiener/0` → `sparse/0` and VkSplat smoke-train on `images_4_wiener` (Exp-C cfg: MCMC 1M, ssim_λ 0.4, 50k steps); judge by eye + LPIPS, never PSNR (Issue #9 caveat — high COLMAP reg-% on blurry source can still train to fog; median-47 << new-fotos median-386, so temper expectations and ENABLE Wiener-restored training tier `images_4_wiener`, not raw `images_4`).
+- See project-memory note `bad-gaussians-not-viable.md` (incl. ZLUDA rejected).
 
 ---
 

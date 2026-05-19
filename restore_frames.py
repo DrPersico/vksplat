@@ -15,8 +15,9 @@ COLMAP tier (images_2) would corrupt feature matching and poses
 ONLY. Poses are already locked by the time training reads these pixels.
 
 Primary path: GPU deep-learning deblur via a pretrained NAFNet
-(GoPro-width64). Inference-only (no autograd) so it sidesteps the
-gsplat-style backward-kernel issues on this machine's ROCm build.
+(GoPro-width64) or Restormer (motion_deblurring). Inference-only (no
+autograd) so it sidesteps the gsplat-style backward-kernel issues on
+this machine's ROCm build.
 
 Fallback path: classical OpenCV/scipy restoration (unsharp / wiener /
 denoise-sharpen). The DL path's GPU dependency is fragile here (Windows
@@ -240,6 +241,158 @@ def load_nafnet(weights_path, device):
     return net
 
 
+DEFAULT_RESTORMER_WEIGHTS = os.path.join(
+    os.path.dirname(__file__), "..", "vksplat_tools", "models",
+    "Restormer_pretrained", "motion_deblurring.pth")
+
+
+def _build_restormer():
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class BiasFree_LayerNorm(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(dim))
+        def forward(self, x):
+            return x / torch.sqrt(x.var(-1, keepdim=True, unbiased=False) + 1e-5) * self.weight
+
+    class WithBias_LayerNorm(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(dim))
+            self.bias = nn.Parameter(torch.zeros(dim))
+        def forward(self, x):
+            mu = x.mean(-1, keepdim=True)
+            return (x - mu) / torch.sqrt(x.var(-1, keepdim=True, unbiased=False) + 1e-5) * self.weight + self.bias
+
+    class LayerNorm2(nn.Module):
+        def __init__(self, dim, bias=True):
+            super().__init__()
+            self.body = WithBias_LayerNorm(dim) if bias else BiasFree_LayerNorm(dim)
+        def forward(self, x):
+            h, w = x.shape[-2:]
+            # b c h w -> b (h w) c -> LN -> b c h w
+            x = x.flatten(2).transpose(1, 2)
+            x = self.body(x)
+            return x.transpose(1, 2).unflatten(2, (h, w))
+
+    class Attention(nn.Module):
+        def __init__(self, dim, num_heads, bias):
+            super().__init__()
+            self.num_heads = num_heads
+            self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+            self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=bias)
+            self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, 3, 1, 1, groups=dim * 3, bias=bias)
+            self.project_out = nn.Conv2d(dim, dim, 1, bias=bias)
+        def forward(self, x):
+            b, c, h, w = x.shape
+            qkv = self.qkv_dwconv(self.qkv(x))
+            q, k, v = qkv.chunk(3, dim=1)
+            hd = c // self.num_heads
+            q = q.view(b, self.num_heads, hd, h * w)
+            k = k.view(b, self.num_heads, hd, h * w)
+            v = v.view(b, self.num_heads, hd, h * w)
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+            attn = (q @ k.transpose(-2, -1)) * self.temperature
+            attn = attn.softmax(dim=-1)
+            out = (attn @ v).view(b, c, h, w)
+            return self.project_out(out)
+
+    class FeedForward(nn.Module):
+        def __init__(self, dim, ffn_exp, bias):
+            super().__init__()
+            hid = int(dim * ffn_exp)
+            self.project_in = nn.Conv2d(dim, hid * 2, 1, bias=bias)
+            self.dwconv = nn.Conv2d(hid * 2, hid * 2, 3, 1, 1, groups=hid * 2, bias=bias)
+            self.project_out = nn.Conv2d(hid, dim, 1, bias=bias)
+        def forward(self, x):
+            x1, x2 = self.dwconv(self.project_in(x)).chunk(2, dim=1)
+            return self.project_out(F.gelu(x1) * x2)
+
+    class TransformerBlock(nn.Module):
+        def __init__(self, dim, heads, ffn_exp, bias, ln_bias):
+            super().__init__()
+            self.norm1 = LayerNorm2(dim, ln_bias)
+            self.attn = Attention(dim, heads, bias)
+            self.norm2 = LayerNorm2(dim, ln_bias)
+            self.ffn = FeedForward(dim, ffn_exp, bias)
+        def forward(self, x):
+            x = x + self.attn(self.norm1(x))
+            x = x + self.ffn(self.norm2(x))
+            return x
+
+    class Downsample(nn.Module):
+        def __init__(self, n):
+            super().__init__()
+            self.body = nn.Sequential(nn.Conv2d(n, n // 2, 3, 1, 1, bias=False), nn.PixelUnshuffle(2))
+        def forward(self, x):
+            return self.body(x)
+
+    class Upsample(nn.Module):
+        def __init__(self, n):
+            super().__init__()
+            self.body = nn.Sequential(nn.Conv2d(n, n * 2, 3, 1, 1, bias=False), nn.PixelShuffle(2))
+        def forward(self, x):
+            return self.body(x)
+
+    class Restormer(nn.Module):
+        def __init__(self, inp_channels=3, out_channels=3, dim=48,
+                     num_blocks=[4, 6, 6, 8], num_refinement=4,
+                     heads=[1, 2, 4, 8], ffn_exp=2.66, bias=False,
+                     ln_bias=True):
+            super().__init__()
+            self.patch_embed = nn.Module()
+            self.patch_embed.proj = nn.Conv2d(inp_channels, dim, 3, 1, 1, bias=bias)
+            self.encoder_level1 = nn.Sequential(*[TransformerBlock(dim, heads[0], ffn_exp, bias, ln_bias) for _ in range(num_blocks[0])])
+            self.down1_2 = Downsample(dim)
+            self.encoder_level2 = nn.Sequential(*[TransformerBlock(dim * 2, heads[1], ffn_exp, bias, ln_bias) for _ in range(num_blocks[1])])
+            self.down2_3 = Downsample(dim * 2)
+            self.encoder_level3 = nn.Sequential(*[TransformerBlock(dim * 4, heads[2], ffn_exp, bias, ln_bias) for _ in range(num_blocks[2])])
+            self.down3_4 = Downsample(dim * 4)
+            self.latent = nn.Sequential(*[TransformerBlock(dim * 8, heads[3], ffn_exp, bias, ln_bias) for _ in range(num_blocks[3])])
+            self.up4_3 = Upsample(dim * 8)
+            self.reduce_chan_level3 = nn.Conv2d(dim * 8, dim * 4, 1, bias=bias)
+            self.decoder_level3 = nn.Sequential(*[TransformerBlock(dim * 4, heads[2], ffn_exp, bias, ln_bias) for _ in range(num_blocks[2])])
+            self.up3_2 = Upsample(dim * 4)
+            self.reduce_chan_level2 = nn.Conv2d(dim * 4, dim * 2, 1, bias=bias)
+            self.decoder_level2 = nn.Sequential(*[TransformerBlock(dim * 2, heads[1], ffn_exp, bias, ln_bias) for _ in range(num_blocks[1])])
+            self.up2_1 = Upsample(dim * 2)
+            self.decoder_level1 = nn.Sequential(*[TransformerBlock(dim * 2, heads[0], ffn_exp, bias, ln_bias) for _ in range(num_blocks[0])])
+            self.refinement = nn.Sequential(*[TransformerBlock(dim * 2, heads[0], ffn_exp, bias, ln_bias) for _ in range(num_refinement)])
+            self.output = nn.Conv2d(dim * 2, out_channels, 3, 1, 1, bias=bias)
+
+        def forward(self, inp):
+            e1 = self.patch_embed.proj(inp)
+            e2 = self.encoder_level2(self.down1_2(self.encoder_level1(e1)))
+            e3 = self.encoder_level3(self.down2_3(e2))
+            lat = self.latent(self.down3_4(e3))
+            d3 = self.decoder_level3(self.reduce_chan_level3(torch.cat([self.up4_3(lat), e3], 1)))
+            d2 = self.decoder_level2(self.reduce_chan_level2(torch.cat([self.up3_2(d3), e2], 1)))
+            d1 = self.decoder_level1(torch.cat([self.up2_1(d2), e1], 1))
+            return self.output(self.refinement(d1)) + inp
+
+    return Restormer()
+
+
+def load_restormer(weights_path, device):
+    import torch
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"Restormer checkpoint not found: {weights_path}")
+    net = _build_restormer()
+    ck = torch.load(weights_path, map_location="cpu", weights_only=False)
+    sd = ck["params"] if isinstance(ck, dict) and "params" in ck else ck
+    missing, unexpected = net.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Restormer state_dict mismatch: {len(missing)} missing, "
+            f"{len(unexpected)} unexpected")
+    net.eval().to(device)
+    return net
+
+
 # Count of tiles whose model output was non-finite and got replaced with
 # input pixels. Single-element list so _infer_tiled can mutate it; the
 # caller resets it per frame and treats >0 as "this frame degraded".
@@ -348,7 +501,7 @@ def restore_one(rgb_u8, method, ctx):
     after this call to know if the frame degraded (a tile fell back to
     blurry input pixels => the frame is only partially deblurred).
     """
-    if method == "dl":
+    if method in ("dl", "restormer"):
         _BAD_TILES[0] = 0
         rest = _infer_tiled(ctx["net"], rgb_u8, ctx["device"],
                             ctx["tile"], ctx["overlap"])
@@ -402,10 +555,12 @@ def main():
     p.add_argument("--out-dir", default=None,
                    help="Output dir (default: sibling <tier>_restored)")
     p.add_argument("--method", default="dl",
-                   choices=["dl", "unsharp", "wiener", "denoise-sharpen"],
-                   help="dl = GPU NAFNet (default); others = classical CPU")
+                   choices=["dl", "restormer", "unsharp", "wiener", "denoise-sharpen"],
+                   help="dl = GPU NAFNet (default); restormer = GPU Restormer; others = classical CPU")
     p.add_argument("--weights", default=DEFAULT_WEIGHTS,
                    help="NAFNet checkpoint path")
+    p.add_argument("--restormer-weights", default=DEFAULT_RESTORMER_WEIGHTS,
+                   help="Restormer checkpoint path")
     p.add_argument("--dl-strength", type=float, default=0.7,
                    help="Blend DL output with original 0..1 (default 0.7); "
                         "lower = more conservative / less hallucination")
@@ -418,6 +573,9 @@ def main():
                    help="Run the NAFNet DL model on CPU (no GPU needed). "
                         "Correct output, just slow — useful to validate "
                         "the DL path or when ROCm is unavailable.")
+    p.add_argument("--force", action="store_true",
+                   help="Allow restoring images_2 (COLMAP tier). Only use when "
+                        "raw frames can't register at all — no clean poses to lose.")
     p.add_argument("--dry-run", action="store_true",
                    help="Probe device + report sharpness delta on a sample; "
                         "write nothing")
@@ -441,10 +599,11 @@ def main():
 
     tier_dir = os.path.abspath(args.tier_dir)
     base = os.path.basename(tier_dir.rstrip("\\/"))
-    if base.endswith("images_2") or base == "images_2":
+    if (base.endswith("images_2") or base == "images_2") and not args.force:
         print("REFUSING: this looks like the COLMAP tier (images_2). "
               "Restoration is training-tier ONLY — it would corrupt poses. "
-              "Point at images_4 (or another training tier).", file=sys.stderr)
+              "Point at images_4 (or another training tier), or use --force "
+              "if raw data can't register at all.", file=sys.stderr)
         sys.exit(2)
     if not os.path.isdir(tier_dir):
         print(f"Not a directory: {tier_dir}", file=sys.stderr)
@@ -461,7 +620,7 @@ def main():
     ctx = {"strength": args.dl_strength, "tile": args.tile,
            "overlap": args.overlap}
 
-    if method == "dl" and args.cpu:
+    if method in ("dl", "restormer") and args.cpu:
         print("--cpu set: using classical 'unsharp' instead of DL.")
         method = "unsharp"
     elif method == "dl" and args.dl_cpu:
@@ -474,16 +633,21 @@ def main():
             print(f"  NAFNet load failed ({e}). Falling back to "
                   f"classical 'unsharp'.", file=sys.stderr)
             method = "unsharp"
-    elif method == "dl":
+    elif method in ("dl", "restormer"):
         dev, info = pick_device()
         if dev == "cuda":
-            print(f"GPU ready: {info} -> NAFNet DL deblur "
+            model_name = "Restormer" if method == "restormer" else "NAFNet"
+            loader = (load_restormer if method == "restormer"
+                      else load_nafnet)
+            wpath = (args.restormer_weights if method == "restormer"
+                     else args.weights)
+            print(f"GPU ready: {info} -> {model_name} DL deblur "
                   f"(strength={args.dl_strength}, tile={args.tile})")
             try:
-                ctx["net"] = load_nafnet(args.weights, "cuda")
+                ctx["net"] = loader(wpath, "cuda")
                 ctx["device"] = "cuda"
             except Exception as e:
-                print(f"  NAFNet load failed ({e}). Falling back to "
+                print(f"  {model_name} load failed ({e}). Falling back to "
                       f"classical 'unsharp'.", file=sys.stderr)
                 method = "unsharp"
         else:
