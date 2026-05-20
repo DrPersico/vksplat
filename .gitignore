@@ -10,3 +10,5 @@ dist/
 *.so
 
 vksplat/third_party/glm
+.claude/settings.local copy.json
+.claude/settings.local.json

@@ -449,10 +449,21 @@ void VulkanGSTrainer::load_colmap_dataset(
             dataset_train.push_back(std::move(result.first));
     }
 
-    // Copy to device
+    // Copy to device and free CPU copies to save system RAM
     if (config.image_cache_device == TrainerConfig::CacheImage::GPU) {
-        for (auto& im : dataset_train) copyToDevice(im.buffer);
-        for (auto& im : dataset_val) copyToDevice(im.buffer);
+        for (auto& im : dataset_train) {
+            copyToDevice(im.buffer);
+            im.buffer.clear();
+            im.buffer.shrink_to_fit();
+        }
+        for (auto& im : dataset_val) {
+            copyToDevice(im.buffer);
+            im.buffer.clear();
+            im.buffer.shrink_to_fit();
+        }
+        printf("GPU image cache: freed CPU copies, %d images on VRAM\n",
+            (int)(dataset_train.size() + dataset_val.size()));
+        fflush(stdout);
     }
 
     // Find scene scale
@@ -634,14 +645,29 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     auto& train_image = dataset_train[train_idx].buffer;
     bool buffer_swapped = false;
     if (train_image.deviceBuffer.buffer == VK_NULL_HANDLE) {
+        // CPU mode: swap ref_image buffer in, upload from CPU
         PerfTimer::Timer<PerfTimer::CopyTrainImageToDevice> timer(this);
         std::swap(train_image.deviceBuffer, buffers.ref_image.deviceBuffer);
         copyToDevice(train_image);
         buffer_swapped = true;
+    } else {
+        // GPU mode: copy to shared ref_image buffer (device-to-device) so the
+        // SSIM descriptor set sees the same VkBuffer handle every step.
+        // Without this, each image's unique handle triggers a HOST_GUARD
+        // descriptor update inside executeCompute, splitting forward+SSIM
+        // into separate command batches and breaking memory barriers.
+        PerfTimer::Timer<PerfTimer::CopyTrainImageToDevice> timer(this);
+        copyFromDeviceToDevice(train_image.deviceBuffer, buffers.ref_image.deviceBuffer);
     }
+
+    // In both modes the SSIM reference image is now in ref_image
+    // (CPU: swapped in; GPU: copied in). Use ref_image for stable descriptors.
+    auto& ssim_ref = buffer_swapped ? train_image.deviceBuffer
+                                    : buffers.ref_image.deviceBuffer;
+
     bufferMemoryBarrier({
         { buffers.pixel_state.deviceBuffer, COMPUTE_SHADER_WRITE },
-        { train_image.deviceBuffer, TRANSFER_WRITE },
+        { ssim_ref, TRANSFER_WRITE },
     }, COMPUTE_SHADER_READ);
 
     PerfTimer::Timer<PerfTimer::ComputeSSIMGradient> timer(this);
@@ -657,7 +683,7 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
         pipeline_ssim_forward,
         {
             buffers.pixel_state.deviceBuffer,
-            train_image.deviceBuffer,
+            ssim_ref,
             resizeDeviceBuffer(ssim_map, 12*num_pixels),
         }
     );
@@ -671,7 +697,7 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
         pipeline_ssim_backward,
         {
             buffers.pixel_state.deviceBuffer,
-            train_image.deviceBuffer,
+            ssim_ref,
             ssim_map.deviceBuffer,
             resizeDeviceBuffer(buffers.v_pixel_state, 4*num_pixels),
         }
