@@ -142,6 +142,191 @@ This machine has MULTIPLE Pythons with DIFFERENT torch builds. Using the wrong o
 
 ## Quality Results
 
+### ⭐⭐⭐ PROJECT BEST: Video Pipeline (updated 2026-05-27)
+
+| Run | Source | Frames | Resolution | cap_max | Steps | ssim_λ | PSNR | SSIM | LPIPS-VGG | LPIPS-Alex | Status |
+|-----|--------|--------|-----------|---------|-------|--------|------|------|-----------|------------|--------|
+| uw_v1 | 4K60 UW video | 566 | 540×960 | 1M | 50k | 0.4 | 30.01 | 0.912 | 0.216 | 0.189 | Baseline |
+| uw_v2 | same | 566 | 540×960 | 1M | 100k | 0.4 | 30.37 | 0.916 | 0.209 | 0.179 | +5.3% |
+| uw_v3 | same | 566 | 540×960 | 1.5M | 100k | 0.4 | 30.21 | 0.916 | 0.203 | 0.172 | +9.5% |
+| uw_v4 | same | 566 | 540×960 | 2M | 100k | 0.4 | 18.71 | 0.756 | 0.473 | 0.692 | FOG |
+| uw_v5 | same | 566 | 540×960 | 1.75M | 100k | 0.4 | 29.91 | 0.911 | 0.214 | 0.185 | Degraded |
+| uw_v6 | same | 566 | 540×960 | 1.5M | 100k | 0.5 | 30.08 | 0.916 | 0.202 | 0.172 | ≈ tied |
+| uw 500k | same | 566 | 540×960 | 1.5M | 500k | 0.4 | — | 0.917 | 0.199 | 0.166 | +12.2% |
+| **uw 1.25M/500k** | same | 566 | 540×960 | **1.25M** | **500k** | 0.4 | — | **0.919** | **0.198** | **0.165** | **⭐ BEST UW** |
+
+**Source**: `E:\Downloads\20260526_085416.mp4` — Samsung S23 ultra-wide (0.6x) 4K60 HDR10 HEVC, 306s, 18389 frames, portrait (2160×3840 after rotation), 144 Mbps.
+**Pipeline**: `video_to_splat.py` — decode 60fps → best-of-window (0.5s) sharpness selection → SSIM dedup → stage → COLMAP sequential → train.
+**COLMAP**: 566/566 (100%) registered, 68711 pts, f=968, SIMPLE_RADIAL k=0 locked.
+**Data path**: `E:\vksplat_data\uw_v1\`, best output: `E:\vksplat_output\uw_v1_uw_1.25M_500k\`
+
+**Key findings (updated 2026-05-27):**
+- **Video DESTROYS stop-and-shoot photos**: LPIPS-Alex 0.165 vs previous best 0.330 (photos, Exp-C). 50% improvement.
+- The ultra-wide 0.6x lens + 4K60fps + best-of-window selection provides ideal SfM coverage despite individual frames being "blurry" by photo standards (median Laplacian 65 at 1080-wide).
+- Dense video coverage (566 strongly-overlapping views) supports higher cap_max than sparse photos.
+- cap_max curve at 100k: 1M=0.179, 1.5M=0.172, 1.75M=0.185, 2M=FOG.
+- **Optimal cap_max via density formula**: `cap_max = 55000 * scene_scale^3` → 1.25M for this dataset. Validated: 1.25M/500k = 0.165 beats 1.5M/500k = 0.166.
+- ssim_lambda 0.4 and 0.5 are equivalent on this data.
+- **UPDATED best config for video: MCMC `55000*scale^3` cap / images_4 / ssim_λ 0.4 / 500k steps / --image-cache-device gpu**.
+- **Capture strategy confirmed: 0.6x ultra-wide 4K60 video >> stop-and-shoot photos.** 50% LPIPS improvement.
+
+### Video Pipeline v1 vs v2 Comparison (2026-05-26)
+
+**Source**: `E:\Downloads\20260526_164638.mp4` — Samsung S23 ultra-wide (0.6x) 4K60 HEVC, 431s, 25866 frames, portrait 2160×3840.
+**Goal**: Compare v1 pipeline (`video_to_splat.py`, CPU scoring, SSIM dedup) vs v2 pipeline (`video_to_splat_v2.py`, GPU scoring, histogram dedup, adaptive selection).
+
+| Metric | v1 Baseline | v2 (best) | Iter3 (fewer) | Iter4 (max frames) |
+|--------|-------------|-----------|---------------|---------------------|
+| Scoring method | CPU Laplacian @1080w | GPU Laplacian @270w | GPU (cached) | GPU (cached) |
+| Scoring speed | 10 fps / 2316s | 20 fps / 1310s | cached | cached |
+| Frames selected | 892 | 1351 | 895 | 1351 |
+| Dedup method | quick_ssim 0.95 | histogram 0.95 | histogram 0.90 | none (1.0) |
+| Frames written | 820 | 498 | 315 | 1349 |
+| COLMAP overlap | 15 | 15 | 25 | 15 |
+| COLMAP registered | 86/820 (10.5%) | 237/498 (47.6%) | 142/315 (45.1%) | 1345/1349 (99.7%) |
+| COLMAP pts | — | — | — | 119,391 |
+| Scene scale | — | — | — | 3.47 |
+| cap_max | 1M | 1M | 1M | 1M |
+| Steps | 50k | 50k | 50k | 50k |
+| PSNR | 31.52 | 29.01 | 26.74 | 8.51 |
+| SSIM | 0.940 | 0.910 | — | 0.179 |
+| LPIPS-Alex | 0.144* | **0.173** | 0.195 | 0.886 (FOG) |
+| Val images | 11 (frames 321-401) | 30 (frames 0-233) | 18 | 169 |
+
+**Iter4 root-cause analysis (2026-05-27):**
+- Disabling dedup (threshold=1.0) gave near-perfect COLMAP (99.7%) but catastrophic training.
+- 1,345 views + 1M splats + scene scale 3.47 = splat budget starvation. Each splat must explain ~1,345 views over a large volume. Compare uw_v3: 566 views, scale ~1.5, 1.5M cap = works perfectly.
+- 169 val images (vs 30 for iter2) also makes LPIPS harder — but main issue is actual fog (PSNR 8.51).
+- **Conclusion**: More COLMAP views does not equal better quality. Sweet spot for UW video is ~400-600 frames with dedup 0.90-0.95. Frame count must be proportional to cap_max and inversely to scene scale.
+- **Fix applied**: Added `--max-frames` parameter to v2 pipeline (caps selected frames before writing).
+
+**Key findings from v1 vs v2:**
+- **v1's PSNR 31.52 is inflated by evaluation scope**: all 11 val images came from frames 321-401, a tight 80-frame cluster where all 86 registered cameras concentrated. v2's 30 val images span the full scene (frames 0-233), including poorly-covered gaps. The PSNR gap is largely an evaluation artifact, not a quality regression.
+- **v2's COLMAP registration is 4.5× better** (47.6% vs 10.5%). v1 only registered cameras in one small area; v2 registered across the full scene. Full-scene registration is more useful for real viewing.
+- **v2's per-frame quality range**: best frame PSNR 32.09 (frame_00185), worst 22.83 (frame_00048). The worst frames correspond to scene areas with sparse camera coverage — not pipeline failures.
+- **Histogram dedup is more accurate than SSIM dedup**: SSIM at thumbnail resolution scored 0.99+ for all same-scene video frames (useless), while histogram correlation correctly distinguishes scene changes from camera motion. The initial SSIM dedup dropped 1348/1351 frames to 1 — a critical bug that was fixed by switching to histograms.
+- **GPU scoring doubles throughput**: 20 fps vs 10 fps. But HEVC decode is the bottleneck (single-threaded ffmpeg), not the scoring — CPU at only 37% during scoring.
+- **v2 added `--scores-cache` for iteration speed**: first run scores all frames and saves to JSON; subsequent runs with different selection/dedup params load the cache, saving 23 min per iteration.
+
+**Pipeline tooling (`video_to_splat_v2.py`):**
+- `--scores-cache <path>`: cache/load scores JSON (skip re-scoring)
+- `--check`: score + select + report (stop before writing/COLMAP)
+- `--skip-to colmap|train|eval`: resume from a specific stage
+- `--soft-threshold`: frames below this sharpness get top-K selection (denser extraction)
+- `--dedup-threshold`: histogram correlation threshold (0.95=aggressive, 0.90=loose, 1.0=none)
+- `--max-frames <N>`: hard cap on frames to write (added 2026-05-27). Keeps sharpest per temporal bin.
+
+### Restoration Methods Comparison (2026-05-27) — test_video_v2 dataset
+
+**Goal**: Test whether pre-processing (deblurring/sharpening) images_4 before training improves quality.
+**Dataset**: test_video_v2 (Samsung S23 ultra-wide 0.6x 4K60, 237/498 registered, scene scale 3.26, median VoL 236).
+**Methods**: NAFNet (DL deblur), Restormer (DL deblur, conservative), unsharp mask (classical).
+
+| Method | cap_max | Steps | VoL change | SSIM | LPIPS-VGG | LPIPS-Alex | vs Raw baseline |
+|--------|---------|-------|-----------|------|-----------|------------|-----------------|
+| Raw (baseline) | 1M | 50k | — | 0.910 | — | 0.173 | — |
+| Raw | 1M | 500k | — | 0.904 | 0.203 | 0.169 | -2.3% |
+| Raw | 1.5M | 100k | — | 0.907 | 0.200 | 0.165 | -4.6% |
+| **Raw** | **2M** | **100k** | — | 0.906 | 0.200 | **0.163** | **-5.8% BEST** |
+| Raw | 3M | 100k | — | 0.902 | 0.203 | 0.166 | -4.0% |
+| Raw | 1.5M | 500k | — | 0.902 | 0.202 | 0.166 | -4.0% |
+| NAFNet | 1M | 100k | +25% | 0.898 | 0.221 | 0.185 | +6.9% worse |
+| Restormer | 1M | 100k | +4% | 0.907 | 0.208 | 0.174 | +0.6% (neutral) |
+| Unsharp mask | 1M | 100k | +130% | 0.867 | 0.259 | 0.229 | +32% MUCH worse |
+
+**Key findings:**
+- **Restoration HURTS on video data.** Same conclusion as video1 experiments (memory.md rows 38-42).
+- **More aggressive sharpening = more damage**: unsharp (+130% VoL) worst, NAFNet (+25%) bad, Restormer (+4%) neutral.
+- **Root cause**: view-inconsistent hallucination. Each frame gets independently deblurred differently; 3DGS cannot resolve the per-view inconsistency, resulting in blurry or foggy renders.
+- **Higher cap_max (2M) outperforms ALL restoration methods AND more steps at 1M cap.** The real bottleneck was splat budget, not image sharpness.
+- **VERDICT: Do NOT restore video frames for 3DGS training. Use raw images + optimal cap_max + 100k-500k steps instead.**
+- **cap_max curve for test_video_v2 (237 views, scale 3.26)**: 1M=0.173, 1.5M=0.165, **2M=0.163**, 3M=0.166. Optimal at 2M.
+- Methods investigated per user request: SMGS (rasterizer mod, N/A), DeblurGS (training-loop mod, N/A for VkSplat), sharp-frames-python (equivalent to existing pipeline), MoBGS/arXiv 2504.15122 (dynamic trainer, N/A for VkSplat). None are VkSplat-compatible as pre-processing.
+
+### Splat Density Analysis (2026-05-27)
+
+**Optimal splat density = ~50-60k splats per cubic unit of scene volume.**
+
+| Dataset | Views | Scale | cap_max | Density (splats/cube) | LPIPS-Alex | Status |
+|---------|-------|-------|---------|----------------------|------------|--------|
+| uw_v1 | 566 | 2.79 | 1M | 46,078 | 0.179 | underfitted |
+| **uw_v1** | **566** | **2.79** | **1.25M** | **57,548** | **0.165 (500k)** | **optimal** |
+| uw_v1 | 566 | 2.79 | 1.5M | 69,117 | 0.172 / 0.166 (500k) | slightly over |
+| uw_v1 | 566 | 2.79 | 1.75M | 80,636 | 0.185 | overdense |
+| uw_v1 | 566 | 2.79 | 2M | 92,166 | 0.692 | FOG |
+| test_v2 | 237 | 3.26 | 1M | 28,862 | 0.173 | underfitted |
+| test_v2 | 237 | 3.26 | 1.5M | 43,293 | 0.165 | good |
+| **test_v2** | **237** | **3.26** | **2M** | **57,724** | **0.163** | **optimal** |
+| test_v2 | 237 | 3.26 | 3M | 86,586 | 0.166 | slightly overdense |
+
+**Formula for optimal cap_max**: `cap_max = 55000 * scene_scale^3`
+- For scene scale 3.26: optimal cap = 55000 * 34.6 = 1.9M (matches empirical 2M best)
+- For scene scale 2.79: optimal cap = 55000 * 21.7 = 1.19M (empirically 1.5M is best, within range)
+- Fog boundary: ~90k splats/cube (hard ceiling, immediate degeneration)
+
+**Interaction with views**: More views with the SAME cap can cause fog (iter4: 1345 views + 1M cap = 24k/cube = fog). This appears to be an optimization dynamics issue: too many diverse viewpoint gradients pulling too few splats in incompatible directions during the active-LR phase (first 30k steps).
+
+---
+
+### Distortion Refinement Experiment (2026-05-27)
+
+**Hypothesis**: Samsung ISP locks distortion to k=0, so `ba_refine_extra_params = False` in COLMAP is suboptimal for ultra-wide lenses.
+**Test**: Enable `ba_refine_extra_params = True` so COLMAP can refine the radial distortion parameter `k`.
+
+**Results**:
+| Config | COLMAP k | cap_max | Steps | LPIPS-Alex | Notes |
+|--------|----------|---------|-------|------------|-------|
+| Original (k locked) | 0.0000 | 2M | 100k | **0.163** | Previous best (OLD COLMAP, now deleted) |
+| k refined (True) | 0.0050 | 2M | 100k | **0.636** | CATASTROPHIC — 4× worse! |
+| k locked (restored) | 0.0000 | 1M | 100k | 0.287 | Regenerated COLMAP, safe cap |
+| k locked (restored) | 0.0000 | 1M | 500k | 0.286 | More steps didn't help (cap bottleneck) |
+
+**Root cause of 0.636 disaster**: VkSplat reads and APPLIES the distortion parameter `k` during rendering. Samsung's ISP already corrects barrel distortion in the output frames — so the images are pre-undistorted. COLMAP fitting a spurious k=0.005 causes VkSplat to render with ~7px shift at corners against undistorted ground truth = systematic mismatch.
+
+**Critical lessons**:
+1. **`ba_refine_extra_params = False` is CORRECT for smartphone ISP-processed images.** The ISP already removes lens distortion before outputting JPEG/HEVC frames.
+2. **NEVER delete a working COLMAP sparse model.** Incremental SfM is non-deterministic — same inputs can produce slightly different reconstructions. The deleted model supported 2M cap; the regenerated one TDRs at >1M on the same GPU.
+3. **TDR limit on RX 7900 XTX with this dataset**: max safe cap_max = 1M (at 1080p resolution). 1.5M and 2M both trigger GPU driver timeout despite 60s TDR setting.
+4. **cap_max is the binding constraint**: 500k steps at 1M cap (0.286) ≈ 100k steps at 1M cap (0.287). The model is at capacity.
+5. **The 0.163 result (old COLMAP) is irreproducible** without the original sparse/0 model. New COLMAP with 1M cap peaks at 0.286.
+
+**Pipeline fix (reverted)**: `ba_refine_extra_params` stays `False` in `video_to_splat_v2.py` with explanatory comment.
+
+---
+
+### High-Step Training Experiments (2026-05-27)
+
+**Goal**: Test whether 500k and 1M training steps improve quality over the proven 50k/100k baselines.
+**Key rule**: Do NOT pass `--max-steps`. Default max_steps=30k freezes LR/noise schedule, making extra steps safe gentle refinement (proven by lr_full plain-100k, memory.md row 24).
+
+| Dataset | Frames | cap_max | Steps | PSNR | SSIM | LPIPS-VGG | LPIPS-Alex | vs Baseline | Time |
+|---------|--------|---------|-------|------|------|-----------|------------|-------------|------|
+| sharp (baseline) | 579 | 1M | 50k | — | — | — | 0.330 | — | 2.5 min |
+| **sharp 500k** | 579 | 1M | 500k | 21.78 | 0.691 | 0.343 | **0.301** | **-8.8%** | 43 min |
+| **sharp 1M** | 579 | 1M | 1M | 21.72 | 0.690 | 0.341 | **0.297** | **-10.0%** | 79 min |
+| uw_v1 (baseline) | 566 | 1.5M | 100k | 30.21 | 0.916 | 0.203 | 0.172 | — | 18 min |
+| **uw_v1 500k** | 566 | 1.5M | 500k | — | 0.917 | 0.199 | 0.166 | -3.5% | 63 min |
+| **uw_v1 1.25M/500k** | 566 | **1.25M** | 500k | — | 0.919 | 0.198 | **0.165** | **-4.1%** | 58 min |
+| test_video_v2 (baseline) | 237 reg/498 | 1M | 50k | 29.01 | 0.910 | — | 0.173 | — | ~8 min |
+| test_video_v2 500k | 237 reg/498 | 1M | 500k | — | 0.904 | 0.203 | 0.169 | -2.3% | 50 min |
+| test_video_v2 1.5M | 237 reg/498 | 1.5M | 100k | — | 0.907 | 0.200 | 0.165 | -4.6% | 16 min |
+| **test_video_v2 2M** | 237 reg/498 | **2M** | 100k | — | 0.906 | 0.200 | **0.163** | **-5.8%** | 20 min |
+| test_video_v2 3M | 237 reg/498 | 3M | 100k | — | 0.902 | 0.203 | 0.166 | -4.0% | 26 min |
+
+**Key findings (2026-05-27):**
+- **500k steps on sharp: LPIPS-Alex 0.301 (was 0.330) = 8.8% improvement.** Significant.
+- **1M steps on sharp: LPIPS-Alex 0.297 (was 0.301 at 500k) = only +1.3% more.** Diminishing returns.
+- **500k steps on uw_v1 (1.25M cap): LPIPS-Alex 0.165 (was 0.172). NEW PROJECT BEST for ultra-wide video.**
+- **test_video_v2 2M/100k: LPIPS-Alex 0.163. NEW PROJECT BEST for this UW video (different scene/capture from uw_v1).**
+- The gain curve flattens sharply between 500k and 1M. Frozen-LR refinement helps but with rapidly diminishing returns.
+- **cap_max matters MORE than steps for video datasets**: raising from 1M→2M at 100k steps (0.173→0.163) beats raising from 50k→500k at 1M cap (0.173→0.169).
+- **Practical recommendation: Use the density formula `cap_max = 55000 * scene_scale^3`, then train 500k steps.**
+- Output paths: `E:\vksplat_output\sharp_sharp_500k\`, `E:\vksplat_output\uw_v1_uw_1.25M_500k\`, `E:\vksplat_output\test_video_v2_test_video_v2_2M_100k\`
+
+---
+
+### Previous Results (photo-based)
+
 | Dataset | Images | Resolution | Strategy | Splats | PSNR | SSIM | Time |
 |---------|--------|-----------|----------|--------|------|------|------|
 | Kitchen photos | 85 | 2000×924 | MCMC 1M | 1M | 21.76 | — | 3.6 min |
@@ -557,6 +742,18 @@ Focal/width ratio ≈ **1.44** — roughly 2× higher than the Samsung wide-angl
 ## Useful Commands
 
 ```bash
+# ⭐ BEST: Full video-to-splat pipeline v2 (2026-05-27, use density formula for cap_max)
+# cap_max = 55000 * scene_scale^3 (scene_scale reported by VkSplat during training)
+# For first run, estimate: use density formula cap_max = 55000 * scene_scale^3
+# Typical: UW video small scene ~1.25M, UW video large scene ~2M, indoor photos ~1M
+python E:\vksplat\video_to_splat_v2.py "E:\Downloads\video.mp4" --name my_scene --steps 500000 --cap-max 1250000 --dedup-threshold 0.90 --max-frames 600
+
+# Quick retrain on existing dataset with optimal cap (skip COLMAP, much faster)
+python E:\vksplat\train_livingroom.py --dataset-dir E:\vksplat_data\my_scene --image-dir images_4 --strategy mcmc --cap-max 2000000 --ssim-lambda 0.4 --steps 500000 --image-cache-device gpu --tag my_tag --output-base E:\vksplat_output
+
+# Resume from training (COLMAP data exists, re-train with different params)
+python E:\vksplat\video_to_splat_v2.py "E:\Downloads\video.mp4" --name my_scene --skip-to train --steps 500000 --cap-max 1500000 --out-root E:\vksplat_data\my_scene
+
 # Stage a flat folder of raw photos into the tiered dataset layout (EXIF-aware)
 python E:\vksplat\prepare_dataset.py "E:\Downloads\50mb full dataset" E:\vksplat_data\full_dataset --skip-fullres
 # default tiers: images_2 width 2040, images_4 width 1020 (override with --width-2 / --width-4)
@@ -832,3 +1029,263 @@ python E:\vksplat\run_eval.py E:\vksplat_output\<output_dir>
 2. ~~Enable Virtual Machine Platform~~ — done (HypervisorPresent=True, WSL2 works)
 3. Install Ubuntu 22.04 on WSL2, relocate its vhdx to F: (C: too small)
 4. Run `setup_rocm_gsplat.sh` inside WSL2 (installs ROCm, ROCDXG, PyTorch, gsplat, nerfstudio)
+
+---
+
+## Dense Frame Extraction Experiment (2026-05-28)
+
+### Background
+Kitchen video `20260527_192641.mp4` (4K60, 770s, 46,157 frames, 0.6x lens, no exposure lock).
+First attempt used adaptive selection → 2,082 frames → dedup at 0.85 → 856 frames → COLMAP registered
+only 166/856 (19.4%) → splat had large gaps. Root cause: too few frames for COLMAP to build
+a dense-enough SfM graph.
+
+### New Frame Extraction Modes Added to `video_to_splat_v2.py`
+Three `--select-mode` values:
+
+| Mode | How it works | Expected frames (kitchen) |
+|------|-------------|--------------------------|
+| `adaptive` | existing: auto-window + soft/hard logic + dedup | ~856 after dedup |
+| `top3ps` | 1s windows, top-3 sharpest per window, no adaptive logic | ~2,313 (dedup disabled) |
+| `every` | every Nth frame, no scoring/dedup at all | ~4,616 (N=10) or ~3,077 (N=15) |
+
+New CLI flags: `--select-mode {adaptive,top3ps,every}`, `--every-n N` (default 10).
+New functions: `select_top_k_per_second()`, `write_every_nth_frame()`.
+
+### Experiment A: top3ps (in progress)
+```
+python video_to_splat_v2.py "E:\Downloads\20260527_192641.mp4" \
+  --name kitchen_top3ps --select-mode top3ps --dedup-threshold 1.0 \
+  --cap-max 7500000 --steps 100000 --viewer \
+  --scores-cache "E:\vksplat_data\kitchen_4k\scores_cache.json"
+```
+- Loaded cached scores (46,210 entries)
+- Selected 2,313 frames (770 windows × 3), sharpness range 38–602 (median 192)
+- Dedup disabled (threshold=1.0) → all 2,313 frames written
+- Status: writing frames, then COLMAP, then 100k training steps
+
+### Experiment B: every 10th frame (queued)
+```
+python video_to_splat_v2.py "E:\Downloads\20260527_192641.mp4" \
+  --name kitchen_every10 --select-mode every --every-n 10 \
+  --cap-max 7500000 --steps 100000 --viewer
+```
+- Expected: ~4,616 frames, no scoring or dedup
+- Status: waiting for Experiment A to finish
+
+### Results
+
+#### Experiment A: top3ps — COMPLETED (2026-05-28)
+- **Frames selected**: 2,313 (770 windows × 3), all written (dedup disabled)
+- **COLMAP**: Feature extraction 287s, sequential matching 1,295s, incremental mapping 5,820s.
+  Total 7,403s (~2h 3m). Registered 1,596/2,307 = **69.2%** (up from 19.4% with adaptive!).
+  137,950 3D points. Post-filter: 1,594 images.
+- **Training**: 100k steps, 7.5M splats (cap hit), 3,684s (~61 min).
+  VRAM: 15.7 GB total, 18.9 GB peak.
+- **Eval metrics (200 val images)**:
+  - PSNR: **9.27 dB** (very poor)
+  - SSIM: 0.001
+  - LPIPS-VGG: 0.484, LPIPS-Alex: 0.906
+- **Output**: `E:\vksplat_output\kitchen_top3ps_kitchen_top3ps_run0\20260528_041015_kitchen_top3ps`
+- **Verdict**: COLMAP registration massively improved (69% vs 19%) but training quality is
+  terrible. Possible causes: (1) eval images come from unregistered viewpoints giving misleading
+  metrics, (2) 100k steps insufficient for 1594 training images at 7.5M splats, (3) auto-exposure
+  drift in the video causing appearance inconsistency that 3DGS can't handle.
+
+#### Experiment B: every 10th frame — CANCELLED
+- Expected ~4,616 frames, no scoring/dedup
+- Killed due to extremely slow COLMAP (10h+ with only 4 threads, no progress logging)
+
+### ALIKED + LightGlue Investigation (2026-05-28)
+
+#### Problem: 69.2% COLMAP registration with SIFT
+- Analysis showed unregistered frames correlate with motion-blurred video segments
+- SIFT struggles with motion blur and exposure drift — not enough repeatable keypoints
+
+#### Solution: ALIKED_N32 + LightGlue (learned features)
+- ALIKED is a learned keypoint detector trained on diverse conditions, more robust to blur
+- LightGlue is a transformer-based matcher that reasons about spatial context
+
+#### Technical challenges:
+1. **Official pycolmap pip wheel (4.0.4) does NOT have ONNX support** — ALIKED enums exist but
+   `COLMAP_ONNX_ENABLED` is not compiled in. Attempting ALIKED crashes with C++ abort.
+2. **Solution**: Installed `pycolmap-4.0.2+cpu` from `lyehe/build_gpu_colmap` pre-built wheels
+   which include ONNX runtime support.
+3. **ONNX model paths**: The lyehe build has ONNX enabled but NOT download support
+   (`COLMAP_DOWNLOAD_ENABLED`), so model paths default to empty strings. Must manually:
+   - Download ONNX models from COLMAP GitHub releases (aliked-n32.onnx, aliked-lightglue.onnx)
+   - Cache them at `~/.cache/colmap/{sha256}-{filename}`
+   - Set `extraction_opts.aliked.n32_model_path` and `matching_opts.aliked.lightglue.model_path`
+4. **Code changes**: Updated `run_colmap()` to auto-download models and set paths when
+   `feature_type="aliked"`. Added `--feature-type` CLI flag.
+
+#### Experiment C: top3ps + ALIKED — COMPLETED (2026-05-29)
+- Same 2,307 frames as Experiment A
+- Using ALIKED_N32 + LightGlue instead of SIFT
+- **Results**:
+  - **Registration rate: 92.2%** (2,127/2,307) — up from 69.2% with SIFT!
+  - 3D points: 207,697 (up from 137,950 with SIFT)
+  - Post-filter: 2,116 images (removed 11 with <90 triangulated pts)
+  - Focal length: 967.9
+- **Timing**:
+  - Feature extraction: 5,402s (~90 min) — ALIKED ONNX inference is ~20× slower than SIFT
+  - Sequential matching: 15,253s (~4h 14m) — LightGlue transformer matching is ~12× slower
+  - Incremental mapping: 17,314s (~4h 49m) — 3× slower due to more matches/points
+  - Total: 37,969s (~10.5h)
+- **Verdict**: ALIKED+LightGlue dramatically improved registration (92% vs 69%).
+  531 additional images registered, 50% more 3D points recovered.
+  The remaining 7.8% unregistered frames (180 images) are likely the most severely
+  motion-blurred segments where even learned features can't find enough repeatable keypoints.
+  Trade-off: ~5× slower total COLMAP time due to CPU-bound ONNX inference.
+- **Training**: 100k steps, 7.5M splats (cap hit), 3,490s (~58 min). VRAM: 11.4 GB total, 15.6 GB peak.
+- **Eval metrics (265 val images)**:
+  - PSNR: **19.32 dB** (vs 9.27 dB with SIFT — +10 dB!)
+  - SSIM: **0.782** (vs 0.001 with SIFT)
+  - LPIPS-VGG: **0.462** (vs 0.484 with SIFT)
+  - LPIPS-Alex: **0.659** (vs 0.906 with SIFT)
+- **Output**: `E:\vksplat_output\kitchen_top3ps_kitchen_top3ps_run0\20260529_110525_kitchen_top3ps`
+- **Verdict**: ALIKED+LightGlue is a game-changer. Higher registration (92% vs 69%) directly
+  translated to dramatically better reconstruction quality. The SIFT run's terrible PSNR (9.27)
+  was likely caused by eval images from unregistered viewpoints rendering as garbage.
+- **UPDATE (2026-05-29)**: ALIKED was later found to produce structureless blobs in trained
+  models despite high registration numbers. The improved registration may have registered
+  frames at wrong poses. **ALIKED has been removed from the pipeline in v3.**
+
+---
+
+## Pipeline v3 — Major Overhaul (2026-05-29)
+
+### What changed (video_to_splat_v2.py is now v3 internally)
+1. **Frame selection**: Custom GPU Laplacian + adaptive selection REPLACED with
+   `sharp-frames` Python package (pip install sharp-frames). Uses best-n selection
+   method purpose-built for 3DGS dataset prep.
+2. **Multi-video input**: Accepts multiple video paths. Frame budget allocated
+   proportionally by duration. Merged into single images_2/ + images_4/ folder.
+3. **ALIKED removed**: SIFT-only. `max_num_features` boosted from 8192 to 16384
+   for better matching at higher resolution.
+4. **COLMAP overlap**: Default changed from 15 to 50. Auto-retry with doubled
+   overlap if registration < 70%.
+5. **Resolution**: Training on `images_2` at 1920px (was `images_4` at 540px).
+   COLMAP also on `images_2`. No more intrinsic rescaling mismatch.
+6. **Training defaults**: 100K steps (was 50K), cap 2M (was 1M), best-of-3 (was 1),
+   ssim_lambda=0.4, max_steps=steps (LR decay spans full run).
+7. **Workers**: Hardcoded to 12 threads for COLMAP.
+8. **Stratified eval**: New `run_eval_stratified.py` with spatial clustering
+   holdout (K-means on camera positions) + interpolation eval (novel poses).
+
+### New scripts
+- `run_eval_stratified.py` — post-training eval with spatially diverse views
+- `run_brush_comparison.py` — A/B/C config comparison between vksplat and Brush
+
+### Pipeline v3 flow
+```
+Probe videos → sharp-frames best-n (per video, proportional budget)
+→ Resize tiers: images_2 (1920px), images_4 (960px)
+→ COLMAP SIFT 16K features, overlap=50, 12 threads (retry at 100 if <70% reg)
+→ Filter poorly-registered views
+→ Train MCMC on images_2 (1920px), 100K steps, cap 2M, best-of-3
+→ Standard eval + Stratified eval
+```
+
+### Example command (3 kitchen videos)
+```powershell
+python video_to_splat_v2.py E:\downloads\20260529_213322.mp4 E:\downloads\20260529_212850.mp4 E:\downloads\20260529_203748.mp4 --name kitchen_v3
+```
+
+### VRAM budget at 1920px
+- Per image: 1920 x 888 x 4 bytes (RGBA) ≈ 6.5 MB
+- 500 frames on GPU cache: ~3.2 GB
+- Leaves ~20 GB for Gaussians on 24 GB RX 7900 XTX
+
+### Brush comparison (E:\brush) — COMPLETED 2026-05-30
+
+**Brush is the winner. vksplat is no longer the primary trainer.**
+
+- Brush is a Rust/WebGPU 3DGS trainer: `E:\brush\target\release\brush.exe`
+- Consumes same COLMAP datasets as vksplat (sparse/0/ + images/)
+- Has native LPIPS loss during training (but very slow on AMD — avoid)
+- No stdout output; use `--eval-save-to-disk` for eval renders
+- `--with-viewer` is a boolean flag (no value), omit for headless training
+
+#### Comparison results (kitchen_v3: 3 videos, 482 images, 960px)
+
+| Config | Trainer | PSNR | SSIM | Time |
+|--------|---------|------|------|------|
+| A (30K, 1M splats, ssim=0.2) | vksplat | 27.56 | 0.898 | 23 min |
+| A (30K, 1M splats, ssim=0.2) | **Brush** | **28.54** | 0.896 | **12 min** |
+| B (100K, 2M, ssim=0.4) | vksplat | 17.04 | 0.777 | 32 min |
+| B (30K, 3M splats, ssim=0.5) | **Brush** | **28.60** | 0.896 | **16 min** |
+| C (100K, 2M, ssim=0.4, best-of-3) | vksplat | 17.48 | 0.789 | 95 min |
+| C (50K, 5M splats, ssim=0.5) | **Brush** | **28.70** | 0.894 | **26 min** |
+
+#### Key findings
+1. **Brush wins across the board**: consistent PSNR 28.5-28.7, 2x faster
+2. **vksplat diverges at high settings**: 100K steps + 2M splats + ssim_lambda=0.4
+   causes training instability (PSNR drops to ~17). Only stable at Config A.
+3. **vksplat TDRs at 1920px**: Training on images_2 (1920x3413 portrait) causes
+   GPU driver timeout on RX 7900 XTX, even with TdrDelay=60s. Only works at images_4 (960px).
+4. **Brush has diminishing returns**: Config A→C only improves by 0.16 dB. Extra
+   splats/steps provide minimal benefit.
+5. **Brush LPIPS loss is unusable on AMD**: Makes training ~30x slower. Disable it.
+
+#### COLMAP findings for multi-video portrait 0.6x ultrawide
+- **Camera priming is harmful**: Auto-estimated f=1420 for 0.6x UW lens was wildly
+  wrong (actual ~800). Removing camera priming and letting COLMAP estimate freely works.
+- **Sequential matching alone gets ~51%**: Only registers one video's worth of frames
+  because cross-video frames have no sequential neighbor matches.
+- **Exhaustive matching is required**: Adding `pycolmap.match_exhaustive()` after
+  sequential matching bridges all 3 videos → 98.8% registration (492/498).
+- **SIMPLE_RADIAL works fine**: Despite ultrawide distortion, SIMPLE_RADIAL with
+  BA refinement converges to f=1720 and registers nearly all frames.
+- **OPENCV model fails**: 8-parameter model can't bootstrap without good initial
+  estimate — only 0.4% registration.
+
+#### Brush parameter sweep (2026-05-30)
+
+All 8 configs tested on kitchen_v3 (482 images, 3 videos merged):
+
+| Config | Res | Steps | Splats | SSIM_w | PSNR | SSIM | Time |
+|--------|-----|-------|--------|--------|------|------|------|
+| res960_50k_5M_sh3 | 960 | 50K | 5M | 0.2 | **28.69** | 0.896 | 12m |
+| **res960_30k_1M** | 960 | 30K | 1M | 0.2 | **28.67** | 0.896 | **6m** |
+| res960_50k_3M | 960 | 50K | 3M | 0.2 | 28.64 | 0.896 | 12m |
+| res1920_30k_3M | 1920 | 30K | 3M | 0.2 | 28.30 | **0.898** | 10m |
+| res1920_50k_5M | 1920 | 50K | 5M | 0.2 | 28.24 | 0.897 | 16m |
+
+**Best config**: `res960_30k_1M` — PSNR 28.67 in 6 minutes. Nearly identical
+to the most expensive config (28.69) at 1/2 the time. Higher SSIM weight hurts.
+1920px gives +0.002 SSIM but -0.3 PSNR and takes longer.
+
+**Recommended Brush command**:
+```powershell
+brush.exe <dataset> --total-train-iters 30000 --max-splats 1000000 --ssim-weight 0.2 --max-resolution 960 --eval-split-every 8 --eval-save-to-disk --export-path <output>
+```
+
+### Brush CLI reference
+```powershell
+# Basic training (headless, with eval renders)
+brush.exe E:\vksplat_data\kitchen_v3 --total-train-iters 30000 --max-splats 1000000 --ssim-weight 0.2 --max-resolution 960 --export-every 5000 --export-path E:\output --eval-split-every 8 --eval-every 1000 --eval-save-to-disk
+
+# Key parameters
+--total-train-iters   # Training steps (default: 30000)
+--max-splats          # Upper bound on splat count (default: 10M)
+--ssim-weight         # SSIM loss weight vs L1 (default: 0.2)
+--max-resolution      # Max image dimension to load (default: 1920)
+--sh-degree           # SH degree for color (default: 3)
+--eval-split-every    # Every Nth image for eval (default: none)
+--eval-save-to-disk   # Save eval renders to export-path
+--export-path         # Where to save PLY exports + eval renders
+--seed                # Random seed (default: 42)
+```
+
+### Dependencies added
+- `sharp-frames` (pip) — frame extraction for 3DGS
+- `scikit-learn` (pip) — K-means clustering for stratified eval
+- `scipy` (pip) — rotation interpolation (Slerp) for interpolated eval views
+- `scikit-image` (pip) — SSIM computation for Brush eval metrics
+
+### PlanarGS Assessment
+- PlanarGS requires CUDA (custom diff-plane-rasterization kernels) — NOT viable on AMD
+- Quality gains are mainly in mesh reconstruction of textureless planes (walls/ceilings)
+- NVS PSNR/LPIPS improvements are modest (+0.6 PSNR)
+- If NVIDIA GPU becomes available, can run as sidecar pipeline sharing COLMAP data

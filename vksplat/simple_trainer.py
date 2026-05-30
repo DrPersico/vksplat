@@ -113,6 +113,76 @@ def PRINT(*args, **kargs):
     print(*args, **kargs, flush=True)
 
 
+class MetricsCollector:
+    """Accumulates training metrics for the real-time viewer dashboard."""
+
+    def __init__(self, total_steps: int, collect_interval: int = 100):
+        self._total_steps = total_steps
+        self._collect_interval = collect_interval
+        self._lock = __import__('threading').Lock()
+        self._points: list = []
+        self._t0: float = 0.0
+
+    def should_collect(self, step: int) -> bool:
+        return step % self._collect_interval == 0
+
+    def set_start_time(self, t0: float):
+        self._t0 = t0
+
+    def record(self, step: int, module, image_idx: int):
+        """Collect metrics after a train_step. Caller must hold the training lock."""
+        t = perf_counter()
+        try:
+            num_splats = len(module.opacities)
+        except Exception:
+            num_splats = 0
+
+        try:
+            rendered = np.clip(module.pixel_state, 0.0, 1.0)
+            ref = module.get_train_image(image_idx)
+            ref = ref.astype(np.float32) / 255.0
+            diff = np.abs(rendered[:, :, :3] - ref[:, :, :3])
+            loss_l1 = float(np.mean(diff))
+            mse = float(np.mean(diff ** 2))
+            psnr = 10.0 * math.log10(1.0 / max(mse, 1e-10))
+        except Exception:
+            loss_l1 = None
+            psnr = None
+
+        try:
+            vram = module.get_vram_usage()
+        except Exception:
+            vram = 0
+
+        elapsed = t - self._t0 if self._t0 else 0.0
+        active_sh = min(step // 1000, 3)
+
+        point = {
+            "step": step,
+            "time": round(elapsed, 2),
+            "num_splats": num_splats,
+            "loss_l1": round(loss_l1, 6) if loss_l1 is not None else None,
+            "psnr": round(psnr, 2) if psnr is not None else None,
+            "active_sh": active_sh,
+            "vram_mb": round(vram / (1024 ** 2), 1) if vram else 0,
+        }
+
+        with self._lock:
+            self._points.append(point)
+
+    def get_metrics(self, since_step: int = 0) -> dict:
+        with self._lock:
+            if since_step > 0:
+                points = [p for p in self._points if p["step"] > since_step]
+            else:
+                points = list(self._points)
+        return {
+            "total_steps": self._total_steps,
+            "collect_interval": self._collect_interval,
+            "points": points,
+        }
+
+
 def train(config: TrainerConfig):
     # from build import vksplat  # or build.Debug, build.Release for MSVC
     import vksplat
@@ -138,6 +208,7 @@ def train(config: TrainerConfig):
 
     lock = nullcontext()
     module_alive = True
+    metrics = MetricsCollector(config.train_steps) if config.enable_viewer else None
     if config.enable_viewer:
         from viewer.server import ViewerServer
         import asyncio
@@ -173,7 +244,7 @@ def train(config: TrainerConfig):
 
         def get_progress(self):
             elapsed = perf_counter() - t0
-            avg_latency = elapsed / step
+            avg_latency = elapsed / step if step > 0 else 0
             remaining_steps = config.train_steps - step
             eta = remaining_steps * avg_latency
             return {
@@ -184,10 +255,14 @@ def train(config: TrainerConfig):
                 "latency_ms": avg_latency * 1000 if avg_latency else None,
             }
 
+        def get_metrics_fn():
+            return metrics.get_metrics() if metrics else {}
+
         async def start_viewer_server():
             server = ViewerServer(
                 render_fn=render,
                 progress_fn=get_progress,
+                metrics_fn=get_metrics_fn,
                 http_host="0.0.0.0",
                 http_port=config.viewer_port,
                 open_browser=False,
@@ -203,6 +278,8 @@ def train(config: TrainerConfig):
 
     # train
     t0 = perf_counter()
+    if metrics:
+        metrics.set_start_time(t0)
     shuffle_idx = list(range(module.num_train))
     for step in tqdm(range(config.train_steps), "Training"):
         if step > 0 and step % len(shuffle_idx) == 0:
@@ -211,6 +288,8 @@ def train(config: TrainerConfig):
         image_idx = shuffle_idx[step % len(shuffle_idx)]
         with lock:
             module.train_step(image_idx, step)
+            if metrics and metrics.should_collect(step):
+                metrics.record(step, module, image_idx)
     t1 = perf_counter()
     with lock:
         num_splats = len(module.opacities)
@@ -291,13 +370,15 @@ def train(config: TrainerConfig):
                 rendered_images.append((path, module.pixel_state))
         save_all_images(rendered_images, "train")
 
-    rendered_images = []
     for i in tqdm(range(module.num_val), "Rendering val images"):
-        with lock:
-            module.render_val(i)
-            path = os.path.join(config.output_dir, f'val_{i:05d}.png')
-            rendered_images.append((path, module.pixel_state))
-    save_all_images(rendered_images, "val")
+        try:
+            with lock:
+                module.render_val(i)
+                path = os.path.join(config.output_dir, f'val_{i:05d}.png')
+                save_one_image(module.pixel_state, path)
+        except Exception as e:
+            PRINT(f"  Warning: val render {i} failed: {e}")
+    PRINT()
 
     # free memory
     with lock:

@@ -16,7 +16,8 @@ def train_at_resolution(image_dir="images_2", tag="1080p", steps=30000,
                         output_base=r"E:\vksplat_output",
                         ssim_lambda=0.2, opacity_reg=None, scale_reg=None,
                         noise_lr=None, max_steps=None,
-                        image_cache_device="cpu"):
+                        image_cache_device="cpu",
+                        enable_viewer=False, viewer_port=7007):
     if strategy == "mcmc":
         config = MCMCTrainerConfig()
         config.cap_max = cap_max
@@ -48,6 +49,8 @@ def train_at_resolution(image_dir="images_2", tag="1080p", steps=30000,
     if noise_lr is not None:
         config.noise_lr = noise_lr
     config.image_cache_device = image_cache_device
+    config.enable_viewer = enable_viewer
+    config.viewer_port = viewer_port
 
     dataset_name = os.path.basename(os.path.normpath(config.dataset_dir))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -106,10 +109,15 @@ if __name__ == "__main__":
                         "copies (~9 GB VRAM for 3852 images_4 frames). "
                         "Eliminates per-step PCIe upload and sustained RAM. "
                         "Only use if dataset fits in VRAM alongside splats.")
+    p.add_argument("--viewer", action="store_true",
+                   help="Enable real-time training viewer (default port 7007)")
+    p.add_argument("--viewer-port", type=int, default=7007,
+                   help="Port for the training viewer HTTP server")
     args = p.parse_args()
     train_at_resolution(args.image_dir, args.tag, args.steps, args.strategy,
                         args.cap_max, args.skip_eval, args.grow_grad2d,
                         args.refine_stop_iter, args.dataset_dir, args.output_base,
                         args.ssim_lambda, args.opacity_reg, args.scale_reg,
                         args.noise_lr, args.max_steps,
-                        args.image_cache_device)
+                        args.image_cache_device,
+                        args.viewer, args.viewer_port)

@@ -472,9 +472,25 @@
       <div id="progress-text"></div>
     </div>
 
-    <!-- <div class="panel-section">
-      <div id="footnote">&lt;GitHub badge&gt; &lt;arXiv badge&gt;</div>
-    </div> -->
+    <!-- Training Metrics -->
+    <div class="panel-section">
+      <div class="panel-section-title">Training Metrics</div>
+      <div id="metrics-stats" style="font-size:10px; line-height:1.7; color:var(--text-dim); margin-bottom:10px;">
+        Waiting for data&hellip;
+      </div>
+      <div class="ctrl-row">
+        <div class="ctrl-label"><span>Loss (L1)</span></div>
+        <canvas id="chart-loss" width="252" height="80" style="width:100%;height:80px;border-radius:3px;background:var(--input-bg);"></canvas>
+      </div>
+      <div class="ctrl-row">
+        <div class="ctrl-label"><span>Splat Count</span></div>
+        <canvas id="chart-splats" width="252" height="80" style="width:100%;height:80px;border-radius:3px;background:var(--input-bg);"></canvas>
+      </div>
+      <div class="ctrl-row">
+        <div class="ctrl-label"><span>PSNR (dB)</span></div>
+        <canvas id="chart-psnr" width="252" height="80" style="width:100%;height:80px;border-radius:3px;background:var(--input-bg);"></canvas>
+      </div>
+    </div>
 
   </div><!-- /panel -->
 </div><!-- /main -->
@@ -1144,6 +1160,143 @@ window.addEventListener("resize", () => {
 });
 
 // ═══════════════════════════════════════════════════════
+// Metrics Charts
+// ═══════════════════════════════════════════════════════
+
+const Metrics = (() => {
+  let _data = { points: [], total_steps: 0 };
+
+  function drawChart(canvasId, points, key, opts = {}) {
+    const canvas = $(canvasId);
+    if (!canvas || points.length < 2) return;
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const vals = points.map(p => p[key]).filter(v => v != null);
+    if (vals.length < 2) return;
+
+    const useLog = opts.logScale && vals.every(v => v > 0);
+    const mapped = useLog ? vals.map(v => Math.log10(v)) : vals;
+    let minV = Math.min(...mapped);
+    let maxV = Math.max(...mapped);
+    if (maxV - minV < 1e-8) { minV -= 0.5; maxV += 0.5; }
+    const pad = (maxV - minV) * 0.08;
+    minV -= pad; maxV += pad;
+
+    const steps = points.filter(p => p[key] != null).map(p => p.step);
+    const minS = steps[0];
+    const maxS = steps[steps.length - 1];
+    const rangeS = Math.max(maxS - minS, 1);
+
+    const chartL = 0, chartR = w, chartT = 2, chartB = h - 12;
+    const cw = chartR - chartL, ch = chartB - chartT;
+
+    // grid lines
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = chartT + (ch * i / 4);
+      ctx.beginPath(); ctx.moveTo(chartL, y); ctx.lineTo(chartR, y); ctx.stroke();
+    }
+
+    // line
+    ctx.strokeStyle = opts.color || "#f74f4f";
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    let first = true;
+    let lastVal = null;
+    for (const p of points) {
+      const v = p[key];
+      if (v == null) continue;
+      const mv = useLog ? Math.log10(v) : v;
+      const x = chartL + ((p.step - minS) / rangeS) * cw;
+      const y = chartT + (1 - (mv - minV) / (maxV - minV)) * ch;
+      if (first) { ctx.moveTo(x, y); first = false; }
+      else ctx.lineTo(x, y);
+      lastVal = v;
+    }
+    ctx.stroke();
+
+    // labels
+    ctx.fillStyle = "rgba(200,202,212,0.5)";
+    ctx.font = "9px monospace";
+    ctx.textBaseline = "top";
+
+    const fmtVal = (v) => {
+      if (v >= 1e6) return (v/1e6).toFixed(1) + "M";
+      if (v >= 1e3) return (v/1e3).toFixed(1) + "K";
+      if (v >= 1) return v.toFixed(2);
+      if (v >= 0.001) return v.toFixed(4);
+      return v.toExponential(1);
+    };
+
+    const rawMin = useLog ? Math.pow(10, minV + pad) : minV + pad;
+    const rawMax = useLog ? Math.pow(10, maxV - pad) : maxV - pad;
+    ctx.textAlign = "left";
+    ctx.fillText(fmtVal(rawMax), chartL + 2, chartT + 1);
+    ctx.textBaseline = "bottom";
+    ctx.fillText(fmtVal(rawMin), chartL + 2, chartB - 1);
+
+    // current value label
+    if (lastVal != null) {
+      ctx.textAlign = "right";
+      ctx.textBaseline = "bottom";
+      ctx.fillStyle = opts.color || "#f74f4f";
+      ctx.font = "bold 10px monospace";
+      ctx.fillText(fmtVal(lastVal), chartR - 2, chartB - 1);
+    }
+
+    // step range
+    ctx.fillStyle = "rgba(200,202,212,0.35)";
+    ctx.font = "8px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(fmtVal(minS) + " → " + fmtVal(maxS), w / 2, chartB + 1);
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch("/metrics");
+      _data = await r.json();
+      update();
+    } catch (e) { /* ignore */ }
+  }
+
+  function update() {
+    const pts = _data.points || [];
+    if (pts.length === 0) return;
+
+    const last = pts[pts.length - 1];
+    const stats = $("metrics-stats");
+    if (stats) {
+      const parts = [];
+      parts.push(`Step <b style="color:var(--text-bright)">${last.step.toLocaleString()}</b> / ${(_data.total_steps||0).toLocaleString()}`);
+      parts.push(`Splats <b style="color:var(--text-bright)">${last.num_splats.toLocaleString()}</b>`);
+      if (last.loss_l1 != null) parts.push(`L1 <b style="color:var(--accent)">${last.loss_l1.toFixed(4)}</b>`);
+      if (last.psnr != null) parts.push(`PSNR <b style="color:var(--accent2)">${last.psnr.toFixed(1)}</b> dB`);
+      parts.push(`SH ${last.active_sh}`);
+      if (last.vram_mb) parts.push(`VRAM <b>${(last.vram_mb/1024).toFixed(2)}</b> GiB`);
+      stats.innerHTML = parts.join(" &middot; ");
+    }
+
+    drawChart("chart-loss", pts, "loss_l1", { logScale: true, color: "#f74f4f" });
+    drawChart("chart-splats", pts, "num_splats", { color: "#7c5af0" });
+    drawChart("chart-psnr", pts, "psnr", { color: "#4ecb71" });
+  }
+
+  return { poll, update };
+})();
+
+setInterval(Metrics.poll, 3000);
+
+// ═══════════════════════════════════════════════════════
 // Progress
 // ═══════════════════════════════════════════════════════
 async function updateProgress() {
@@ -1184,6 +1337,7 @@ setInterval(updateProgress, 1000);
   setStatus("ready");
   cam.reset();
   fetchBuffers();
+  Metrics.poll();
   Viewer.loopRender();
   // Initial res label
   const res = getResolution($("res-slider").value);

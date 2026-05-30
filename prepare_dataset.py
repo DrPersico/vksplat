@@ -69,13 +69,22 @@ def process_one(src_path: str, out_paths: dict, target_widths: dict) -> tuple:
 
     target_widths[tier] == 0 means "keep source resolution unchanged".
     """
-    with Image.open(src_path) as im:
-        ex = im.getexif()
-        orient = ex.get(EXIF_ORIENTATION_TAG, 1)
-        arr = np.array(im)
-    orig_h, orig_w = arr.shape[:2]
-    arr = apply_orientation(arr, orient)
-    oriented_h, oriented_w = arr.shape[:2]
+    ext = os.path.splitext(src_path)[1].lower()
+    if ext in ('.arw',):
+        import rawpy
+        with rawpy.imread(src_path) as raw:
+            # rawpy postprocess automatically handles auto-rotation (using EXIF).
+            arr = raw.postprocess()
+        orig_h, orig_w = arr.shape[:2]
+        oriented_h, oriented_w = orig_h, orig_w
+    else:
+        with Image.open(src_path) as im:
+            ex = im.getexif()
+            orient = ex.get(EXIF_ORIENTATION_TAG, 1)
+            arr = np.array(im)
+        orig_h, orig_w = arr.shape[:2]
+        arr = apply_orientation(arr, orient)
+        oriented_h, oriented_w = arr.shape[:2]
 
     for tier, out_path in out_paths.items():
         tw = target_widths[tier]
@@ -104,7 +113,7 @@ def main() -> None:
     p.add_argument("--quality", type=int, default=95, help="JPEG quality")
     args = p.parse_args()
 
-    patterns = ("*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.png", "*.PNG")
+    patterns = ("*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.png", "*.PNG", "*.arw", "*.ARW")
     files: list = []
     for pat in patterns:
         files.extend(glob.glob(os.path.join(args.src_dir, pat)))
